@@ -1,17 +1,16 @@
 from typing import List
 
 import pymupdf4llm
-from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_community.document_loaders import UnstructuredMarkdownLoader
 from langchain_community.vectorstores import Chroma
 from langchain_core.vectorstores import VectorStoreRetriever
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai.embeddings import OpenAIEmbeddings
-from langchain_core.tools import tool
 
+# from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai.embeddings import OpenAIEmbeddings
 
 
 def convert_pdf_to_markdown(pdf_file: str) -> str:
@@ -32,6 +31,7 @@ def convert_pdf_to_markdown(pdf_file: str) -> str:
 
     return markdown_file_path
 
+
 def load_markdown_files(processed_data_path: str) -> List:
     """
     Load markdown files
@@ -47,6 +47,7 @@ def load_markdown_files(processed_data_path: str) -> List:
     docs = loader.load()
 
     return docs
+
 
 def get_chunks(docs: List, chunk_size: int = 500, chunk_overlap: int = 200) -> List:
     """
@@ -67,9 +68,10 @@ def get_chunks(docs: List, chunk_size: int = 500, chunk_overlap: int = 200) -> L
 
     return chunks
 
-def store_chunks_into_vectorstore(chunks: List, api_key:str) -> VectorStoreRetriever:
+
+def store_chunks_into_vectorstore(chunks: List, api_key: str) -> VectorStoreRetriever:
     # Create embeddings
-    model_kwargs = {"trust_remote_code": True}
+    # model_kwargs = {"trust_remote_code": True}
     # embeddings = HuggingFaceEmbeddings(
     #     model_name="Lajavaness/bilingual-embedding-large",
     #     show_progress=True,
@@ -84,6 +86,7 @@ def store_chunks_into_vectorstore(chunks: List, api_key:str) -> VectorStoreRetri
     )
 
     return retriever
+
 
 def get_compressed_docs(
     retriever: VectorStoreRetriever,
@@ -104,7 +107,8 @@ def get_compressed_docs(
 
     return compression_retriever
 
-def run_preprocess(pdf_path: str, api_key:str) -> ContextualCompressionRetriever:
+
+def run_preprocess(pdf_path: str, api_key: str) -> ContextualCompressionRetriever:
     markdown_file_path = convert_pdf_to_markdown(pdf_path)
     loaded_markdown_doc = load_markdown_files(markdown_file_path)
     chunks = get_chunks(loaded_markdown_doc)
@@ -114,6 +118,7 @@ def run_preprocess(pdf_path: str, api_key:str) -> ContextualCompressionRetriever
     return compression_retriever
 
 
-
 if __name__ == "__main__":
-    run_preprocess("/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf")
+    run_preprocess(
+        "/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf"
+    )
