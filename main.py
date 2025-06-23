@@ -1,127 +1,276 @@
 import os
 from pprint import pprint
-from typing import Literal
+from typing import Annotated, Literal, Sequence, TypedDict
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
-from langchain_core.tools import tool
+from langchain import hub
+from langchain.tools.retriever import create_retriever_tool
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
 from langchain_openai.chat_models import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from pydantic import BaseModel, Field
 
 from preprocess import run_preprocess
 
 load_dotenv()  # take environment variables
+api_key = os.getenv("OPENAI_API_KEY")
 
 
-class RetrieverInput(BaseModel):
-    query: str
+compress_retriever = run_preprocess(
+    "/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf",
+    api_key,
+)
+compress_retriever_tool = create_retriever_tool(
+    compress_retriever,
+    "uploaded_insurance_document",
+    "Details about the uploaded insurance document.",
+)
+tools = [compress_retriever_tool]
 
 
-@tool(args_schema=RetrieverInput)
-def retriever(query: str) -> list:
+class AgentState(TypedDict):
+    # The add_messages function defines how an update should be processed
+    # Default is to replace. add_messages says "append"
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+# Edges
+def grade_documents(state) -> Literal["generate", "rewrite"]:
     """
-    Function to retreive information about the query regarding Insurance
-    Will retrieve additional information from vector database
+    Determines whether the retrieved documents are relevant to the question.
 
-    Parameters
-    ----------
-    compress_retriever : ContextualCompressionRetriever
-        The retriever used to fetch compressed, relevant context from the database.
-    query : str
-        The user's query.
+    Args:
+        state (messages): The current state
 
-
-    Returns
-    -------
-    list :
-        List of top k retrieved document chunks
+    Returns:
+        str: A decision for whether the documents are relevant or not
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    compress_retriever = run_preprocess(
-        "/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf",
-        api_key,
+
+    print("---CHECK RELEVANCE---")
+
+    # Data model
+    class grade(BaseModel):
+        """Binary score for relevance check."""
+
+        binary_score: str = Field(description="Relevance score 'yes' or 'no'")
+
+    # LLM
+    model = ChatOpenAI(temperature=0, model="gpt-4-turbo", streaming=True)
+
+    # LLM with tool and validation
+    llm_with_tool = model.with_structured_output(grade)
+
+    # Prompt
+    prompt = PromptTemplate(
+        template="""You are a grader assessing relevance of a retrieved document to a user question. \n
+            Here is the retrieved document: \n\n {context} \n\n
+            Here is the user question: {question} \n
+            If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n
+            Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.""",
+        input_variables=["context", "question"],
     )
-    result = compress_retriever.invoke(query)
 
-    return result
+    # Chain
+    chain = prompt | llm_with_tool
+
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    question = messages[0].content
+    docs = last_message.content
+
+    scored_result = chain.invoke({"question": question, "context": docs})
+
+    score = scored_result.binary_score
+
+    if score == "yes":
+        print("---DECISION: DOCS RELEVANT---")
+        return "generate"
+
+    else:
+        print("---DECISION: DOCS NOT RELEVANT---")
+        print(score)
+        return "rewrite"
+
+
+# Nodes
+def agent(state):
+    """
+    Invokes the agent model to generate a response based on the current state. Given
+    the question, it will decide to retrieve using the retriever tool, or simply end.
+
+    Args:
+        state (messages): The current state
+
+    Returns:
+        dict: The updated state with the agent response appended to messages
+    """
+    print("---CALL AGENT---")
+    messages = state["messages"]
+    model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo")
+    model = model.bind_tools(tools)
+    response = model.invoke(messages)
+    # We return a list, because this will get added to the existing list
+    return {"messages": [response]}
+
+
+def rewrite(state):
+    """
+    Transform the query to produce a better question.
+
+    Args:
+        state (messages): The current state
+
+    Returns:
+        dict: The updated state with re-phrased question
+    """
+
+    print("---TRANSFORM QUERY---")
+    messages = state["messages"]
+    question = messages[0].content
+
+    msg = [
+        HumanMessage(
+            content=f""" \n
+        Look at the input and try to reason about the underlying semantic intent / meaning. \n
+        Here is the initial question:
+        \n ------- \n
+        {question}
+        \n ------- \n
+        Formulate an improved question: """,
+        )
+    ]
+
+    # Grader
+    model = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", streaming=True)
+    response = model.invoke(msg)
+    return {"messages": [response]}
+
+
+def generate(state):
+    """
+    Generate answer
+
+    Args:
+        state (messages): The current state
+
+    Returns:
+         dict: The updated state with re-phrased question
+    """
+    print("---GENERATE---")
+    messages = state["messages"]
+    question = messages[0].content
+    last_message = messages[-1]
+
+    docs = last_message.content
+
+    # Prompt
+    prompt = hub.pull("rlm/rag-prompt")
+
+    # LLM
+    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0, streaming=True)
+
+    # Post-processing
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    # Chain
+    rag_chain = prompt | llm | StrOutputParser()
+
+    # Run
+    response = rag_chain.invoke({"context": docs, "question": question})
+    return {"messages": [response]}
+
+
+def main():
+    # Define a new graph
+    workflow = StateGraph(AgentState)
+
+    # Define the nodes we will cycle between
+    workflow.add_node("agent", agent)  # agent
+    retrieve = ToolNode([compress_retriever_tool])
+    workflow.add_node("retrieve", retrieve)  # retrieval
+    workflow.add_node("rewrite", rewrite)  # Re-writing the question
+    workflow.add_node(
+        "generate", generate
+    )  # Generating a response after we know the documents are relevant
+    # Call agent node to decide to retrieve or not
+    workflow.add_edge(START, "agent")
+
+    # Decide whether to retrieve
+    workflow.add_conditional_edges(
+        "agent",
+        # Assess agent decision
+        tools_condition,
+        {
+            # Translate the condition outputs to nodes in our graph
+            "tools": "retrieve",
+            END: END,
+        },
+    )
+
+    # Edges taken after the `action` node is called.
+    workflow.add_conditional_edges(
+        "retrieve",
+        # Assess agent decision
+        grade_documents,
+    )
+    workflow.add_edge("generate", END)
+    workflow.add_edge("rewrite", "agent")
+
+    # Compile
+    graph = workflow.compile()
+
+    inputs = {
+        "messages": [
+            ("user", "Tell me great active protector insurance plan?"),
+        ]
+    }
+    for output in graph.stream(inputs):
+        for key, value in output.items():
+            pprint(f"Output from node '{key}':")
+            pprint("---")
+            pprint(value, indent=2, width=80, depth=None)
+        pprint("\n---\n")
+
+
+# class RetrieverInput(BaseModel):
+#     query: str
+
+
+# @tool(args_schema=RetrieverInput)
+# def retriever(query: str) -> list:
+#     """
+#     Function to retreive information about the query regarding Insurance
+#     Will retrieve additional information from vector database
+
+#     Parameters
+#     ----------
+#     compress_retriever : ContextualCompressionRetriever
+#         The retriever used to fetch compressed, relevant context from the database.
+#     query : str
+#         The user's query.
+
+
+#     Returns
+#     -------
+#     list :
+#         List of top k retrieved document chunks
+#     """
+#     api_key = os.getenv("OPENAI_API_KEY")
+#     compress_retriever = run_preprocess(
+#         "/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf",
+#         api_key,
+#     )
+#     result = compress_retriever.invoke(query)
+
+#     return result
 
 
 if __name__ == "__main__":
 
-    # print(retriever.name)
-    # print(retriever.description)
-    # print(retriever.args)
-    # compress_retriever = run_preprocess("/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf")
-    # result = retriever(compress_retriever, 'why great protector active ?')
-    # # pprint(result)
-    api_key = os.getenv("OPENAI_API_KEY")
-
-    tools = [retriever]
-    tool_node = ToolNode(tools)
-
-    # # OpenAI LLM model
-    model = ChatOpenAI(model="gpt-4-turbo", temperature=0, api_key=api_key).bind_tools(
-        tools
-    )
-    # res = model.invoke("Hi")
-    # pprint(res.content)
-
-    # Function to decide whether to continue or stop the workflow
-    def should_continue(state: MessagesState) -> Literal["tools", END]:
-        messages = state["messages"]
-        last_message = messages[-1]
-        # If the LLM makes a tool call, go to the "tools" node
-        if last_message.tool_calls:
-            return "tools"
-        # Otherwise, finish the workflow
-        return END
-
-    # Function that invokes the model
-    def call_model(state: MessagesState):
-        messages = state["messages"]
-        response = model.invoke(messages)
-        return {"messages": [response]}  # Returns as a list to add to the state
-
-    # Define the workflow with LangGraph
-    workflow = StateGraph(MessagesState)
-
-    # Add nodes to the graph
-    workflow.add_node("agent", call_model)
-    workflow.add_node("tools", tool_node)
-
-    # Connect nodes
-    workflow.add_edge(START, "agent")  # Initial entry
-    workflow.add_conditional_edges(
-        "agent", should_continue
-    )  # Decision after the "agent" node
-    workflow.add_edge("tools", "agent")  # Cycle between tools and agent
-
-    # Configure memory to persist the state
-    checkpointer = MemorySaver()
-
-    # Compile the graph into a LangChain Runnable application
-    app = workflow.compile(checkpointer=checkpointer)
-
-    # Execute the workflow
-    final_state = app.invoke(
-        {
-            "messages": [
-                HumanMessage(
-                    content="""You are an intelligent assistant. Be friendly and use the tools to help you.
-                                   The tool contain all the insurance details need to know about. Only use these insurance information.
-                                   Do not hallucinate.If you do not know an answer, reply that you do not know.
-                                   Question :
-                                   Tell me more about GREAT Protector Active basic plan"""
-                )
-            ]
-        },
-        config={"configurable": {"thread_id": 42}},
-    )
-
-    # Show the final response
-    print(final_state["messages"][-1].content)
-    print("-------------------------------------------------")
-    pprint(final_state["messages"])
+    main()
