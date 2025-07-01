@@ -1,8 +1,13 @@
+import asyncio
+import glob
 import os
-from pprint import pprint
 from typing import Annotated, Literal, Sequence, TypedDict
 
 from dotenv import load_dotenv
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
 from langchain import hub
 from langchain.tools.retriever import create_retriever_tool
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -14,16 +19,63 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 
-from preprocess import run_preprocess
+from preprocess import (
+    create_vector_store,
+    preprocess_document_to_markdown,
+    run_preprocess,
+)
+
+app = FastAPI()
+
 
 load_dotenv()  # take environment variables
 api_key = os.getenv("OPENAI_API_KEY")
 
+# Allow requests from any frontend (CORS)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount the templates directory
+templates = Jinja2Templates(directory="templates")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile | None = File(None)):
+    if not file:
+        return {"message": "No upload file sent"}
+    else:
+        os.makedirs("uploads", exist_ok=True)  # ensure the directory exists
+        content = await file.read()
+        with open(f"uploads/{file.filename}", "wb") as out_file:
+            out_file.write(content)
+        return {"filename": file.filename}
+
+
+pdf_files = []
+for name in glob.glob("uploads/*.pdf"):
+    pdf_files.append(name)
+    print(name)
+
+# markdown_chunks = []
+# for file in pdf_files:
+#     preprocess_document_to_markdown()
+
 
 compress_retriever = run_preprocess(
-    "/Users/user/Documents/agent_rag_langgraph/agent_rag_langgraph/data/gels-pdt-gpa-brochure.pdf",
+    pdf_files[-1],
     api_key,
 )
+
+
 compress_retriever_tool = create_retriever_tool(
     compress_retriever,
     "uploaded_insurance_document",
@@ -111,7 +163,8 @@ def agent(state):
     """
     print("---CALL AGENT---")
     messages = state["messages"]
-    model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo")
+
+    model = ChatOpenAI(temperature=0, streaming=True, model="gpt-3.5-turbo")
     model = model.bind_tools(tools)
     response = model.invoke(messages)
     # We return a list, because this will get added to the existing list
@@ -136,7 +189,7 @@ def rewrite(state):
     msg = [
         HumanMessage(
             content=f""" \n
-        Look at the input and try to reason about the underlying semantic intent / meaning. \n
+        Look at the input and try to reason about the underlying semantic intent / meaning. Be specific and add additional details if needed \n
         Here is the initial question:
         \n ------- \n
         {question}
@@ -146,7 +199,8 @@ def rewrite(state):
     ]
 
     # Grader
-    model = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", streaming=True)
+    model = ChatOpenAI(temperature=0, model="gpt-4-turbo", streaming=True)
+    # model = init_chat_model(model="openai:gpt-4-turbo", tags=['joke_3'], temperature=0)
     response = model.invoke(msg)
     return {"messages": [response]}
 
@@ -172,7 +226,8 @@ def generate(state):
     prompt = hub.pull("rlm/rag-prompt")
 
     # LLM
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0, streaming=True)
+    # llm = init_chat_model(model="openai:gpt-4.1", tags=['joke_output'], temperature=0)
+    llm = ChatOpenAI(model_name="gpt-4.1", temperature=0, streaming=True)
 
     # Post-processing
     def format_docs(docs):
@@ -186,13 +241,46 @@ def generate(state):
     return {"messages": [response]}
 
 
-def main():
+class Question(BaseModel):
+    question: str
+
+
+@app.post("/chat")
+async def main(question: Question):
+    vector_db = create_vector_store(api_key)
+
+    pdf_files = []
+    for name in glob.glob("uploads/*.pdf"):
+        pdf_files.append(name)
+        print(name)
+
+    markdown_chunks = []
+    for file in pdf_files:
+        chunks = preprocess_document_to_markdown(file)
+        markdown_chunks.append(chunks)
+
+    for doc in markdown_chunks:
+        vector_db.add_documents(documents=doc)
+
+    retriever = vector_db.as_retriever(
+        search_type="similarity",
+    )
+
+    # compression_retriever = get_compressed_docs(retriever)
+
+    compress_retriever_tool = create_retriever_tool(
+        retriever,
+        "uploaded_insurance_document",
+        "Details about the uploaded insurance document.",
+    )
+    tools = [compress_retriever_tool]
+
     # Define a new graph
     workflow = StateGraph(AgentState)
 
     # Define the nodes we will cycle between
     workflow.add_node("agent", agent)  # agent
-    retrieve = ToolNode([compress_retriever_tool])
+    retrieve = ToolNode(tools)
     workflow.add_node("retrieve", retrieve)  # retrieval
     workflow.add_node("rewrite", rewrite)  # Re-writing the question
     workflow.add_node(
@@ -227,15 +315,61 @@ def main():
 
     inputs = {
         "messages": [
-            ("user", "Tell me great active protector insurance plan?"),
+            ("user", question.question),
         ]
     }
-    for output in graph.stream(inputs):
-        for key, value in output.items():
-            pprint(f"Output from node '{key}':")
-            pprint("---")
-            pprint(value, indent=2, width=80, depth=None)
-        pprint("\n---\n")
+    # async for output, metadata in graph.astream(inputs, stream_mode="messages"):
+    #         if output.content:
+    #             print(output.content, end="", flush=True)
+
+    async def stream_generator():
+        try:
+            async for output, metadata in graph.astream(inputs, stream_mode="messages"):
+                if (
+                    output.content
+                    and output.content.strip()
+                    and metadata["langgraph_node"] == "generate"
+                ):
+                    print(f"Yielding: {output.content}")  # Debug
+                    yield output.content + " "
+                    await asyncio.sleep(0)  # Let event loop continue
+                elif (
+                    output.content
+                    and output.content.strip()
+                    and metadata["langgraph_node"] == "agent"
+                ):
+                    print(f"Yielding: {output.content}")  # Debug
+                    yield output.content + " "
+                    await asyncio.sleep(0)  # Let event loop continue
+                elif (
+                    output.content
+                    and output.content.strip()
+                    and metadata["langgraph_node"] == "retrieve"
+                ):
+                    print(f"Yielding: {output.content}")  # Debug
+                    await asyncio.sleep(0)  # Let event loop continue
+                else:
+                    print("Skipping empty content")
+        except Exception as e:
+            print("Stream error:", str(e))
+            yield f"Error: {str(e)}\n"
+
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    # pprint(output)
+    # for key, value in output.items():
+    #     pprint(f"Output from node '{key}':")
+    #     pprint("---")
+    #     pprint(value, indent=2, width=80, depth=None)
+    # pprint("\n---\n")
+    # import json
+    # def event_generator():
+    #     for chunk in graph.stream(inputs):
+    #         for key, value in chunk.items():
+    #             print(value)
+    #             yield json.dumps({key: str(value)}) + "\n"
+
+    # return StreamingResponse(event_generator(), media_type="application/json")
 
 
 # class RetrieverInput(BaseModel):

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ask a Question</title>
+  <style>
+    #responseOutput {
+      background: #f3f3f3;
+      padding: 10px;
+      height: 200px;               /* Fixed height */
+      overflow-y: auto;            /* Scrolls vertically */
+      white-space: pre-wrap;       /* Wrap text nicely */
+      border: 1px solid #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h2>Upload a Document</h2>
+  <input type="file" id="fileInput" /><br><br>
+  <button onclick="uploadFile()">Upload</button>
+  <div id="uploadStatus"></div>
+
+  <hr>
+
+  <h2>Ask a Question</h2>
+  <input type="text" id="questionInput" placeholder="Enter your question" size="50" /><br><br>
+  <button onclick="sendQuestion()">Submit</button>
+
+  <h3>Answer:</h3>
+  <pre id="responseOutput"></pre>
+
+  <script>
+    let uploadedFileId = null;
+    let uploadedFilename = null;
+
+    async function uploadFile() {
+      const fileInput = document.getElementById("fileInput");
+      const status = document.getElementById("uploadStatus");
+      const file = fileInput.files[0];
+      if (!file) {
+        alert("Please choose a file first.");
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch("http://127.0.0.1:8000/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        uploadedFileId = data.file_id;
+        uploadedFilename = data.filename;
+        status.textContent = `Uploaded: ${data.filename}`;
+      } else {
+        status.textContent = "Upload failed.";
+      }
+    }
+
+    async function sendQuestion() {
+      const question = document.getElementById("questionInput").value;
+      const output = document.getElementById("responseOutput");
+      output.textContent = "";
+
+      const body = JSON.stringify({
+        question: question,
+        file_id: uploadedFileId,
+        filename: uploadedFilename,
+      });
+
+      const response = await fetch("http://127.0.0.1:8000/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: body,
+      });
+
+      if (!response.ok) {
+        output.textContent = "Error: " + response.statusText;
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        output.textContent += decoder.decode(value, { stream: true });
+
+        // Auto-scroll to bottom
+        output.scrollTop = output.scrollHeight;
+      }
+    }
+  </script>
+</body>
+</html>

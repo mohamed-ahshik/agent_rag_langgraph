@@ -1,3 +1,6 @@
+notebooks/experiment_fastapi.py
+/uploads
+/chroma_langchain_db/*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
